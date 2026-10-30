@@ -7,38 +7,60 @@ import argparse
 import base64
 import logging
 import queue
+import random
+import signal
 import re
 import socket
 import ssl
 import sys
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from .config import DEFAULT_CONFIG_FILE, ListenerConfig, Settings, configure_logging, get_settings
 from .json_logger import JsonlLogger
-from .mail_storage import store_mail_message
-from .rate_limiter import RateLimitDecision, RateLimiter
+from .mail_storage import MailDirQuota, store_mail_message
+from .rate_limiter import RateLimitDecision, RateLimiter, source_key
 from .tls import TlsMaterial, build_server_context, ensure_tls_material
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_CONN_TIMEOUT = 30
 DEFAULT_MAX_MAIL_BODY_BYTES = 10_485_760
+DEFAULT_MAX_SESSION_SECONDS = 300
+DEFAULT_MAX_CONNECTIONS_PER_IP = 10
+DEFAULT_MAX_RECIPIENTS = 100
+DEFAULT_MAX_MAILS_PER_SESSION = 20
+DEFAULT_MAX_CONCURRENT_DATA = 10
+DEFAULT_BANNER = "ESMTP Postfix"
 MAX_COMMAND_LINE_BYTES = 16_384
-# Cap on SMTP input lines carried in each event. Commands such as NOOP or
-# RSET reset the error counter, so without a cap a client could grow the
-# transcript (and every JSON line that repeats it) without bound.
+# Every event carries the SMTP input of its session, so the transcript is
+# capped by lines, by bytes and per line. Commands such as NOOP or RSET
+# reset the error counter, without the caps a client could grow every
+# JSON line that repeats the transcript without bound.
 MAX_LOGGED_INPUT_LINES = 200
+MAX_LOGGED_INPUT_BYTES = 32_768
+MAX_LOGGED_LINE_BYTES = 1_024
+# AUTH attempts logged per session; the ones beyond it are answered, counted
+# in smtp_input_count and named in errors, but get no event of their own.
+MAX_AUTH_EVENTS_PER_SESSION = 20
+# Commands per session before the session is closed.
+MAX_COMMANDS_PER_SESSION = 1_000
 # Upper bound in seconds for a TLS handshake (STARTTLS and implicit TLS), so
 # a peer that never completes it cannot pin a handler thread. A smaller
-# conn_timeout takes precedence.
+# conn_timeout takes precedence. It bounds the whole handshake, not each read.
 TLS_HANDSHAKE_TIMEOUT_SECONDS = 10
 
-_DATA_TERMINATOR_RE = re.compile(rb"(?:\r?\n|\A)\.\r?\n")
-_DATA_TERMINATOR_TAIL = 4
+_DATA_READ_CHUNK = 65_536
+_DOT_STUFFING_RE = re.compile(rb"(\A|\n)\.")
 _SMTP_PATH_RE = re.compile(r":\s*(?:<([^>]*)>|([^\s]+))", re.IGNORECASE)
+_QUEUE_ID_ALPHABET = "0123456789ABCDEF"
+
+
+class SessionTimeLimit(socket.timeout):
+    """The absolute time limit of a session (not the idle timeout) is reached."""
 
 
 def utc_now() -> datetime:
@@ -123,13 +145,36 @@ class SMTPLineReader:
     This is what lets the server handle SMTP PIPELINING correctly.
     """
 
-    def __init__(self, sock: socket.socket):
+    def __init__(
+        self,
+        sock: socket.socket,
+        deadline: Optional[float] = None,
+        idle_timeout: Optional[float] = None,
+    ):
         self.sock = sock
         self.buffer = b""
+        # time.monotonic() value at which the session ends, None for no limit
+        self.deadline = deadline
+        self.idle_timeout = idle_timeout
+
+    def _recv(self, size: int) -> bytes:
+        if self.deadline is None:
+            return self.sock.recv(size)
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise SessionTimeLimit("session time limit reached")
+        timeout = remaining if self.idle_timeout is None else min(self.idle_timeout, remaining)
+        self.sock.settimeout(timeout)
+        try:
+            return self.sock.recv(size)
+        except socket.timeout:
+            if time.monotonic() >= self.deadline:
+                raise SessionTimeLimit("session time limit reached") from None
+            raise
 
     def readline(self) -> Optional[bytes]:
         while b"\n" not in self.buffer:
-            chunk = self.sock.recv(4096)
+            chunk = self._recv(4096)
             if not chunk:
                 return None
             self.buffer += chunk
@@ -145,28 +190,56 @@ class SMTPLineReader:
         return line
 
     def read_data(self, max_bytes: int) -> Tuple[bytes, bool]:
-        body = bytearray()
+        """
+        Read a DATA body up to <CRLF>.<CRLF> and undo the dot-stuffing.
 
-        while len(body) < max_bytes:
-            remaining = max_bytes - len(body)
+        A client that sends bare LF line ends throughout may end with
+        <LF>.<LF>; once a CRLF was seen only <CRLF>.<CRLF> ends the body, so
+        a bare <LF>.<LF> inside a CRLF message stays part of it. Only the new
+        bytes of each read are searched (with an overlap of 4 bytes), the
+        body is never copied while it grows.
+        """
+        # A leading CRLF lets a terminator at the very start match as well.
+        body = bytearray(b"\r\n")
+        crlf_seen = False
+
+        while len(body) - 2 < max_bytes:
+            remaining = max_bytes - (len(body) - 2)
             if self.buffer:
-                chunk = self.buffer[: min(len(self.buffer), remaining, 4096)]
+                chunk = self.buffer[: min(len(self.buffer), remaining, _DATA_READ_CHUNK)]
                 self.buffer = self.buffer[len(chunk) :]
             else:
-                chunk = self.sock.recv(min(4096, remaining))
+                chunk = self._recv(min(_DATA_READ_CHUNK, remaining))
 
             if not chunk:
                 break
 
-            search_start = max(0, len(body) - _DATA_TERMINATOR_TAIL)
+            search_start = max(0, len(body) - 4)
             body.extend(chunk)
-            current = bytes(body)
-            match = _DATA_TERMINATOR_RE.search(current, search_start)
-            if match:
-                self.buffer = current[match.end() :] + self.buffer
-                return current[: match.start()], True
 
-        return bytes(body), False
+            end: Optional[int] = None
+            end_length = 0
+            crlf_end = body.find(b"\r\n.\r\n", search_start)
+            if crlf_end != -1:
+                end, end_length = crlf_end, 5
+            if not crlf_seen:
+                first_crlf = body.find(b"\r\n", max(2, search_start))
+                lf_end = body.find(b"\n.\n", search_start)
+                if lf_end != -1 and (first_crlf == -1 or first_crlf > lf_end):
+                    if end is None or lf_end < end:
+                        end, end_length = lf_end, 3
+                crlf_seen = first_crlf != -1
+
+            if end is not None:
+                self.buffer = bytes(body[end + end_length :]) + self.buffer
+                return _undo_dot_stuffing(bytes(body[2:end])), True
+
+        return _undo_dot_stuffing(bytes(body[2:])), False
+
+
+def _undo_dot_stuffing(body: bytes) -> bytes:
+    """Remove the leading dot the client added to every line starting with a dot."""
+    return _DOT_STUFFING_RE.sub(rb"\1", body)
 
 
 class SessionTranscript:
@@ -178,22 +251,76 @@ class SessionTranscript:
     def __init__(self) -> None:
         self.lines: List[str] = []
         self.count = 0
+        self.logged_bytes = 0
+        self.full = False
         self.truncated = False
         self.last_response_code: Optional[int] = None
         self.outcome = "ok"
+        self.auth_dropped = 0
 
     def record_input(self, line: str) -> None:
         self.count += 1
-        if len(self.lines) < MAX_LOGGED_INPUT_LINES:
-            self.lines.append(line)
-        else:
+        if self.full or len(self.lines) >= MAX_LOGGED_INPUT_LINES:
+            self.full = True
             self.truncated = True
+            return
+        encoded = line.encode("utf-8", errors="replace")
+        if len(encoded) > MAX_LOGGED_LINE_BYTES:
+            line = encoded[:MAX_LOGGED_LINE_BYTES].decode("utf-8", errors="ignore")
+            encoded = line.encode("utf-8")
+            self.truncated = True
+        # +1 for the newline that joins the lines
+        if self.logged_bytes + len(encoded) + 1 > MAX_LOGGED_INPUT_BYTES:
+            self.full = True
+            self.truncated = True
+            return
+        self.lines.append(line)
+        self.logged_bytes += len(encoded) + 1
 
     def record_response(self, response: str) -> None:
         try:
             self.last_response_code = int(response[:3])
         except ValueError:
             pass
+
+
+class ConnectionTracker:
+    """
+    Open connections per source (IPv4 address, IPv6 /64), shared by the
+    listeners, so one source cannot take every connection slot.
+    """
+
+    def __init__(self, max_per_source: int):
+        self.max_per_source = max_per_source
+        self._lock = threading.Lock()
+        self._open: Dict[str, int] = {}
+
+    def acquire(self, src_ip: str) -> bool:
+        if not self.max_per_source or self.max_per_source <= 0:
+            return True
+        key = source_key(src_ip)
+        with self._lock:
+            count = self._open.get(key, 0)
+            if count >= self.max_per_source:
+                return False
+            self._open[key] = count + 1
+            return True
+
+    def release(self, src_ip: str) -> None:
+        if not self.max_per_source or self.max_per_source <= 0:
+            return
+        key = source_key(src_ip)
+        with self._lock:
+            count = self._open.get(key, 0) - 1
+            if count > 0:
+                self._open[key] = count
+            else:
+                self._open.pop(key, None)
+
+
+def _queue_id() -> str:
+    """A queue id as Postfix prints it after an accepted mail."""
+    return "".join(random.choice(_QUEUE_ID_ALPHABET) for _ in range(10))
 
 
 class SMTPHoneypot:
@@ -221,6 +348,15 @@ class SMTPHoneypot:
         tls_cert_file: Optional[str] = None,
         rate_limiter: Optional[RateLimiter] = None,
         json_logger: Optional[JsonlLogger] = None,
+        banner: str = DEFAULT_BANNER,
+        max_session_seconds: int = DEFAULT_MAX_SESSION_SECONDS,
+        max_connections_per_ip: int = DEFAULT_MAX_CONNECTIONS_PER_IP,
+        max_recipients: int = DEFAULT_MAX_RECIPIENTS,
+        max_mails_per_session: int = DEFAULT_MAX_MAILS_PER_SESSION,
+        max_attachments_per_mail: int = 50,
+        connection_tracker: Optional["ConnectionTracker"] = None,
+        data_slots: Optional[threading.Semaphore] = None,
+        mail_quota: Optional[MailDirQuota] = None,
     ):
         self.bind_ip = bind_ip
         self.bind_port = bind_port
@@ -241,6 +377,18 @@ class SMTPHoneypot:
         self.tls_cert_file = tls_cert_file
         self.rate_limiter = rate_limiter
         self.json_logger = json_logger or JsonlLogger(log_file)
+        self.banner = banner
+        self.max_session_seconds = max_session_seconds
+        self.max_recipients = max_recipients
+        self.max_mails_per_session = max_mails_per_session
+        self.max_attachments_per_mail = max_attachments_per_mail
+        self.connection_tracker = connection_tracker or ConnectionTracker(
+            max_connections_per_ip
+        )
+        self.data_slots = data_slots or threading.BoundedSemaphore(
+            DEFAULT_MAX_CONCURRENT_DATA
+        )
+        self.mail_quota = mail_quota
         self.socket: Optional[socket.socket] = None
         self._stopping = threading.Event()
         self._connection_slots = (
@@ -269,7 +417,9 @@ class SMTPHoneypot:
         ]
         if self.advertise_starttls and self.tls_context is not None and not tls_active:
             lines.append("250-STARTTLS")
-        lines.extend(["250-AUTH PLAIN LOGIN", "250 8BITMIME"])
+        lines.extend(
+            ["250-AUTH PLAIN LOGIN", "250-ENHANCEDSTATUSCODES", "250 8BITMIME"]
+        )
         return (
             "\r\n".join(lines)
             + "\r\n"
@@ -324,10 +474,17 @@ class SMTPHoneypot:
                 )
 
                 if self._connection_slots and not self._connection_slots.acquire(False):
-                    try:
-                        client.sendall(b"421 4.3.2 Too many connections\r\n")
-                    finally:
-                        client.close()
+                    self._refuse(client, "421 4.3.2 Service not available, too many connections\r\n")
+                    continue
+
+                if not self.connection_tracker.acquire(str(addr[0])):
+                    if self._connection_slots:
+                        self._connection_slots.release()
+                    self._refuse(
+                        client,
+                        f"421 4.7.0 {self.server_name} Error: too many connections "
+                        f"from {addr[0]}\r\n",
+                    )
                     continue
 
                 client_handler = threading.Thread(
@@ -340,6 +497,43 @@ class SMTPHoneypot:
                 if self._stopping.is_set():
                     break
                 logger.error("Error accepting connection: %s", exc)
+
+    def _refuse(self, client: socket.socket, response: str) -> None:
+        """Turn a connection away; an implicit TLS listener closes it without a plain text reply."""
+        try:
+            if not self.implicit_tls:
+                client.settimeout(1)
+                client.sendall(response.encode("ascii", errors="replace"))
+        except OSError:
+            pass
+        finally:
+            client.close()
+
+    def _tls_handshake(self, client_socket: socket.socket) -> ssl.SSLSocket:
+        """
+        Run the server side TLS handshake within _handshake_timeout() in total.
+        The socket timeout only bounds each read, a watchdog shuts the socket
+        down when the whole handshake takes longer.
+        """
+        timeout = self._handshake_timeout()
+
+        def _abort() -> None:
+            try:
+                client_socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+        watchdog = threading.Timer(timeout, _abort)
+        watchdog.daemon = True
+        client_socket.settimeout(timeout)
+        watchdog.start()
+        try:
+            assert self.tls_context is not None
+            tls_socket = self.tls_context.wrap_socket(client_socket, server_side=True)
+        finally:
+            watchdog.cancel()
+        tls_socket.settimeout(self._idle_timeout())
+        return tls_socket
 
     def _handle_client_with_slot_release(
         self, client_socket: socket.socket, addr: Tuple[Any, ...]
@@ -355,12 +549,7 @@ class SMTPHoneypot:
                     client_socket.close()
                     return
                 try:
-                    client_socket.settimeout(self._handshake_timeout())
-                    client_socket = self.tls_context.wrap_socket(
-                        client_socket,
-                        server_side=True,
-                    )
-                    client_socket.settimeout(self._idle_timeout())
+                    client_socket = self._tls_handshake(client_socket)
                 except (ssl.SSLError, OSError) as exc:
                     logger.info(
                         "Implicit TLS handshake failed from %s:%s: %s",
@@ -372,6 +561,7 @@ class SMTPHoneypot:
                     return
             self._handle_client(client_socket, addr)
         finally:
+            self.connection_tracker.release(str(addr[0]))
             if self._connection_slots:
                 self._connection_slots.release()
 
@@ -575,6 +765,8 @@ class SMTPHoneypot:
             body,
             save_mail_body=self.save_mail_bodies,
             save_attachments=self.save_attachments,
+            max_attachments=self.max_attachments_per_mail,
+            quota=self.mail_quota,
         )
 
     def _handle_auth_plain(
@@ -601,7 +793,9 @@ class SMTPHoneypot:
                 return True
 
         decoded = _decode_auth_plain(auth_value)
-        auth_events.append(
+        self._record_auth(
+            auth_events,
+            transcript,
             {
                 "timestamp": isoformat_utc(utc_now()),
                 "method": "plain",
@@ -609,9 +803,9 @@ class SMTPHoneypot:
                 "username": decoded["username"],
                 "password": decoded["password"],
                 "decode_error": decoded["decode_error"],
-            }
+            },
         )
-        self._send(client_socket, "235 2.7.0 Authentication successful\r\n", transcript)
+        self._send(client_socket, self._auth_response(decoded), transcript)
         return True
 
     def _handle_auth_login(
@@ -651,7 +845,9 @@ class SMTPHoneypot:
             return True
 
         decoded = _decode_auth_login(username_b64, password_b64)
-        auth_events.append(
+        self._record_auth(
+            auth_events,
+            transcript,
             {
                 "timestamp": isoformat_utc(utc_now()),
                 "method": "login",
@@ -659,10 +855,30 @@ class SMTPHoneypot:
                 "username": decoded["username"],
                 "password": decoded["password"],
                 "decode_error": decoded["decode_error"],
-            }
+            },
         )
-        self._send(client_socket, "235 2.7.0 Authentication successful\r\n", transcript)
+        self._send(client_socket, self._auth_response(decoded), transcript)
         return True
+
+    @staticmethod
+    def _record_auth(
+        auth_events: List[Dict[str, Any]],
+        transcript: SessionTranscript,
+        auth: Dict[str, Any],
+    ) -> None:
+        if len(auth_events) >= MAX_AUTH_EVENTS_PER_SESSION:
+            transcript.auth_dropped += 1
+            return
+        auth_events.append(auth)
+
+    @staticmethod
+    def _auth_response(decoded: Dict[str, Optional[str]]) -> str:
+        """Every login succeeds, a response that cannot be decoded fails as on a real server."""
+        if decoded["username"] is None and decoded["password"] is None:
+            return "501 5.5.2 Cannot decode response\r\n"
+        if decoded["decode_error"]:
+            return "535 5.7.8 Error: authentication failed\r\n"
+        return "235 2.7.0 Authentication successful\r\n"
 
     def _emit_final_events(
         self,
@@ -763,28 +979,58 @@ class SMTPHoneypot:
         auth_events: List[Dict[str, Any]] = []
         mail_events: List[Dict[str, Any]] = []
         errors: List[str] = []
-        suppress_final_log = False
         tls_active = self.implicit_tls
         tls_info = self._tls_event_fields(client_socket, tls_active)
 
         helo_name: Optional[str] = None
+        greeted = False
+        mail_started = False
         envelope_from: Optional[str] = None
         envelope_to: List[str] = []
 
         if self.conn_timeout and self.conn_timeout > 0:
             client_socket.settimeout(self.conn_timeout)
 
-        reader = SMTPLineReader(client_socket)
+        deadline = (
+            time.monotonic() + self.max_session_seconds
+            if self.max_session_seconds and self.max_session_seconds > 0
+            else None
+        )
+        reader = SMTPLineReader(client_socket, deadline, self._idle_timeout())
+
+        def rate_limited(decision: RateLimitDecision) -> bool:
+            return self._rate_limit_denied(
+                client_socket,
+                decision,
+                session_id=session_id,
+                src_ip=src_ip,
+                src_port=src_port,
+                dest_ip=dest_ip,
+                dest_port=dest_port,
+                session_start=session_start,
+                transcript=transcript,
+                errors=errors,
+                tls_info=tls_info,
+            )
 
         try:
             self._send(
                 client_socket,
-                f"220 {self.server_name} ESMTP Service Ready\r\n",
+                f"220 {self.server_name} {self.banner}\r\n",
                 transcript,
             )
             error_count = 0
+            command_count = 0
 
-            while error_count < 10:
+            while True:
+                if error_count >= 10:
+                    self._send(
+                        client_socket,
+                        f"421 4.7.0 {self.server_name} Error: too many errors\r\n",
+                        transcript,
+                    )
+                    transcript.outcome = "error"
+                    break
                 try:
                     raw_line = self._read_client_line(reader, transcript)
                     if raw_line is None:
@@ -794,12 +1040,37 @@ class SMTPHoneypot:
                     if not stripped:
                         continue
 
+                    command_count += 1
+                    if command_count > MAX_COMMANDS_PER_SESSION:
+                        errors.append(
+                            f"command limit of {MAX_COMMANDS_PER_SESSION} reached"
+                        )
+                        self._send(
+                            client_socket,
+                            f"421 4.7.0 {self.server_name} Error: too many commands\r\n",
+                            transcript,
+                        )
+                        transcript.outcome = "limit"
+                        break
+
                     upper = stripped.upper()
                     command = stripped.split(None, 1)[0].upper()
 
                     if command in {"EHLO", "HELO"}:
                         parts = stripped.split(None, 1)
-                        helo_name = parts[1] if len(parts) > 1 else None
+                        if len(parts) < 2:
+                            self._send(
+                                client_socket,
+                                f"501 Syntax: {command} hostname\r\n",
+                                transcript,
+                            )
+                            error_count += 1
+                            continue
+                        helo_name = parts[1]
+                        greeted = True
+                        mail_started = False
+                        envelope_from = None
+                        envelope_to = []
                         response = (
                             self._ehlo_response(tls_active=tls_active)
                             if command == "EHLO"
@@ -809,127 +1080,134 @@ class SMTPHoneypot:
                         error_count = 0
 
                     elif upper.startswith("MAIL FROM"):
+                        if mail_started:
+                            self._send(
+                                client_socket,
+                                "503 5.5.1 Error: nested MAIL command\r\n",
+                                transcript,
+                            )
+                            error_count += 1
+                            continue
+                        if (
+                            self.max_mails_per_session
+                            and self.max_mails_per_session > 0
+                            and len(mail_events) >= self.max_mails_per_session
+                        ):
+                            errors.append(
+                                "mail limit of "
+                                f"{self.max_mails_per_session} per session reached"
+                            )
+                            self._send(
+                                client_socket,
+                                f"421 4.7.0 {self.server_name} Error: too many "
+                                "messages in this session\r\n",
+                                transcript,
+                            )
+                            transcript.outcome = "limit"
+                            break
                         envelope_from = _extract_smtp_path(stripped)
                         envelope_to = []
                         if self.rate_limiter and envelope_from:
                             decision = self.rate_limiter.check("sender", envelope_from)
-                            if self._rate_limit_denied(
-                                client_socket,
-                                decision,
-                                session_id=session_id,
-                                src_ip=src_ip,
-                                src_port=src_port,
-                                dest_ip=dest_ip,
-                                dest_port=dest_port,
-                                session_start=session_start,
-                                transcript=transcript,
-                                errors=errors,
-                                tls_info=tls_info,
-                            ):
-                                suppress_final_log = True
+                            if rate_limited(decision):
                                 break
-                        self._send(client_socket, "250 2.1.0 OK\r\n", transcript)
+                        mail_started = True
+                        self._send(client_socket, "250 2.1.0 Ok\r\n", transcript)
                         error_count = 0
 
                     elif upper.startswith("RCPT TO"):
+                        if not mail_started:
+                            self._send(
+                                client_socket,
+                                "503 5.5.1 Error: need MAIL command\r\n",
+                                transcript,
+                            )
+                            error_count += 1
+                            continue
+                        if (
+                            self.max_recipients
+                            and self.max_recipients > 0
+                            and len(envelope_to) >= self.max_recipients
+                        ):
+                            self._send(
+                                client_socket,
+                                "452 4.5.3 Error: too many recipients\r\n",
+                                transcript,
+                            )
+                            error_count += 1
+                            continue
                         recipient = _extract_smtp_path(stripped)
                         if recipient:
                             envelope_to.append(recipient)
-                        self._send(client_socket, "250 2.1.5 OK\r\n", transcript)
+                        self._send(client_socket, "250 2.1.5 Ok\r\n", transcript)
                         error_count = 0
 
                     elif command == "DATA":
+                        if not mail_started or not envelope_to:
+                            self._send(
+                                client_socket,
+                                "503 5.5.1 Error: need RCPT command\r\n",
+                                transcript,
+                            )
+                            error_count += 1
+                            continue
                         if self.rate_limiter:
-                            ip_decision = self.rate_limiter.check("ip", src_ip)
-                            if self._rate_limit_denied(
-                                client_socket,
-                                ip_decision,
-                                session_id=session_id,
-                                src_ip=src_ip,
-                                src_port=src_port,
-                                dest_ip=dest_ip,
-                                dest_port=dest_port,
-                                session_start=session_start,
-                                transcript=transcript,
-                                errors=errors,
-                                tls_info=tls_info,
+                            if rate_limited(self.rate_limiter.check("ip", src_ip)):
+                                break
+                            if rate_limited(
+                                self.rate_limiter.check("sender", envelope_from)
                             ):
-                                suppress_final_log = True
                                 break
 
-                            sender_decision = self.rate_limiter.check(
-                                "sender", envelope_from
+                        if not self.data_slots.acquire(False):
+                            errors.append("DATA refused: too many mails in transfer")
+                            self._send(
+                                client_socket,
+                                "451 4.3.0 Error: queue file write error\r\n",
+                                transcript,
                             )
-                            if self._rate_limit_denied(
-                                client_socket,
-                                sender_decision,
-                                session_id=session_id,
-                                src_ip=src_ip,
-                                src_port=src_port,
-                                dest_ip=dest_ip,
-                                dest_port=dest_port,
-                                session_start=session_start,
-                                transcript=transcript,
-                                errors=errors,
-                                tls_info=tls_info,
-                            ):
-                                suppress_final_log = True
-                                break
-
-                        self._send(
-                            client_socket,
-                            "354 End data with <CR><LF>.<CR><LF>\r\n",
-                            transcript,
-                        )
-                        body, terminator_found = reader.read_data(
-                            self.max_mail_body_bytes
-                        )
-
-                        message_id = str(uuid.uuid4())
-                        message_timestamp = utc_now()
-                        storage: Dict[str, Any] = {}
+                            error_count += 1
+                            continue
                         try:
-                            storage = self._store_and_describe_mail(
+                            self._send(
+                                client_socket,
+                                "354 End data with <CR><LF>.<CR><LF>\r\n",
+                                transcript,
+                            )
+                            body, terminator_found = reader.read_data(
+                                self.max_mail_body_bytes
+                            )
+                            self._capture_mail(
+                                mail_events,
+                                errors,
                                 src_ip=src_ip,
                                 session_id=session_id,
-                                message_id=message_id,
+                                helo_name=helo_name,
+                                envelope_from=envelope_from,
+                                envelope_to=envelope_to,
                                 body=body,
+                                terminator_found=terminator_found,
                             )
-                        except OSError as exc:
-                            errors.append(f"mail storage failed: {exc}")
-                            logger.error("Failed to write mail body: %s", exc)
-
-                        attachments = storage.get("attachments", [])
-                        mail_events.append(
-                            {
-                                "mail.message_id": message_id,
-                                "mail.timestamp": isoformat_utc(message_timestamp),
-                                "mail.sequence": len(mail_events) + 1,
-                                "mail.envelope_from": envelope_from,
-                                "mail.envelope_to": list(envelope_to),
-                                "mail.header_from": storage.get("header_from"),
-                                "mail.header_to": storage.get("header_to"),
-                                "mail.subject": storage.get("subject"),
-                                "mail.sending_mailserver": helo_name,
-                                "mail.eml_file": storage.get("eml_file"),
-                                "mail.eml_size": storage.get("eml_size"),
-                                "mail.truncated": not terminator_found,
-                                "attachments": attachments,
-                            }
-                        )
+                        finally:
+                            self.data_slots.release()
 
                         if self.rate_limiter:
                             self.rate_limiter.record_message(src_ip, envelope_from)
 
                         if terminator_found:
-                            self._send(client_socket, "250 2.0.0 Ok\r\n", transcript)
+                            self._send(
+                                client_socket,
+                                f"250 2.0.0 Ok: queued as {_queue_id()}\r\n",
+                                transcript,
+                            )
+                            mail_started = False
                             envelope_from = None
                             envelope_to = []
                             error_count = 0
                         elif len(body) >= self.max_mail_body_bytes:
                             self._send(
                                 client_socket,
-                                "552 5.3.4 Message size limit exceeded\r\n",
+                                "552 5.3.4 Error: message file too big\r\n",
                                 transcript,
                             )
                             transcript.outcome = "error"
@@ -937,13 +1215,21 @@ class SMTPHoneypot:
                         else:
                             self._send(
                                 client_socket,
-                                "421 4.4.2 Connection closed\r\n",
+                                f"421 4.4.2 {self.server_name} Error: timeout exceeded\r\n",
                                 transcript,
                             )
                             transcript.outcome = "error"
                             break
 
                     elif command == "AUTH":
+                        if not greeted:
+                            self._send(
+                                client_socket,
+                                "503 5.5.1 Error: send HELO/EHLO first\r\n",
+                                transcript,
+                            )
+                            error_count += 1
+                            continue
                         parts = stripped.split(None, 2)
                         mechanism = parts[1].upper() if len(parts) >= 2 else ""
                         if mechanism == "PLAIN":
@@ -969,25 +1255,36 @@ class SMTPHoneypot:
                         else:
                             self._send(
                                 client_socket,
-                                "504 5.5.4 Unrecognized authentication type\r\n",
+                                "535 5.7.8 Error: authentication failed: "
+                                "Invalid authentication mechanism\r\n",
                                 transcript,
                             )
                             error_count += 1
 
                     elif command == "RSET":
+                        mail_started = False
                         envelope_from = None
                         envelope_to = []
-                        self._send(client_socket, "250 2.0.0 OK\r\n", transcript)
+                        self._send(client_socket, "250 2.0.0 Ok\r\n", transcript)
                         error_count = 0
 
                     elif command == "NOOP":
-                        self._send(client_socket, "250 2.0.0 OK\r\n", transcript)
+                        self._send(client_socket, "250 2.0.0 Ok\r\n", transcript)
                         error_count = 0
 
                     elif command == "VRFY":
+                        parts = stripped.split(None, 1)
+                        if len(parts) < 2:
+                            self._send(
+                                client_socket,
+                                "501 5.5.4 Syntax: VRFY address\r\n",
+                                transcript,
+                            )
+                            error_count += 1
+                            continue
                         self._send(
                             client_socket,
-                            "252 2.0.0 Cannot VRFY user\r\n",
+                            f"252 2.0.0 {parts[1][:256]}\r\n",
                             transcript,
                         )
                         error_count = 0
@@ -996,7 +1293,7 @@ class SMTPHoneypot:
                         if tls_active:
                             self._send(
                                 client_socket,
-                                "503 5.5.1 TLS is already active\r\n",
+                                "554 5.5.1 Error: TLS already active\r\n",
                                 transcript,
                             )
                             error_count += 1
@@ -1004,7 +1301,7 @@ class SMTPHoneypot:
                         if not self.advertise_starttls or self.tls_context is None:
                             self._send(
                                 client_socket,
-                                "454 4.7.0 TLS not available\r\n",
+                                "502 5.5.1 Error: command not implemented\r\n",
                                 transcript,
                             )
                             error_count += 1
@@ -1016,12 +1313,7 @@ class SMTPHoneypot:
                             transcript,
                         )
                         try:
-                            client_socket.settimeout(self._handshake_timeout())
-                            client_socket = self.tls_context.wrap_socket(
-                                client_socket,
-                                server_side=True,
-                            )
-                            client_socket.settimeout(self._idle_timeout())
+                            client_socket = self._tls_handshake(client_socket)
                         except (ssl.SSLError, OSError) as exc:
                             errors.append(f"STARTTLS handshake failed: {exc}")
                             logger.info(
@@ -1035,14 +1327,17 @@ class SMTPHoneypot:
 
                         tls_active = True
                         tls_info = self._tls_event_fields(client_socket, tls_active)
-                        reader = SMTPLineReader(client_socket)
+                        # Plain text pipelined behind STARTTLS is dropped (RFC 3207)
+                        reader = SMTPLineReader(client_socket, deadline, self._idle_timeout())
                         helo_name = None
+                        greeted = False
+                        mail_started = False
                         envelope_from = None
                         envelope_to = []
                         error_count = 0
 
                     elif command == "QUIT":
-                        self._send(client_socket, "221 2.0.0 Goodbye\r\n", transcript)
+                        self._send(client_socket, "221 2.0.0 Bye\r\n", transcript)
                         break
 
                     else:
@@ -1053,6 +1348,26 @@ class SMTPHoneypot:
                         )
                         error_count += 1
 
+                except SessionTimeLimit:
+                    errors.append(
+                        f"session time limit of {self.max_session_seconds}s reached"
+                    )
+                    logger.info(
+                        "Connection from %s:%s reached the session time limit of %ss",
+                        src_ip,
+                        src_port,
+                        self.max_session_seconds,
+                    )
+                    try:
+                        self._send(
+                            client_socket,
+                            f"421 4.4.2 {self.server_name} Error: timeout exceeded\r\n",
+                            transcript,
+                        )
+                    except OSError:
+                        pass
+                    transcript.outcome = "timeout"
+                    break
                 except socket.timeout:
                     errors.append(f"connection timed out after {self.conn_timeout}s")
                     logger.info(
@@ -1064,7 +1379,7 @@ class SMTPHoneypot:
                     try:
                         self._send(
                             client_socket,
-                            "421 4.4.2 Connection timed out\r\n",
+                            f"421 4.4.2 {self.server_name} Error: timeout exceeded\r\n",
                             transcript,
                         )
                     except OSError:
@@ -1074,7 +1389,11 @@ class SMTPHoneypot:
                 except ValueError as exc:
                     errors.append(str(exc))
                     transcript.outcome = "error"
-                    self._send(client_socket, "500 5.5.2 Line too long\r\n", transcript)
+                    self._send(
+                        client_socket,
+                        "500 5.5.2 Error: line too long\r\n",
+                        transcript,
+                    )
                     break
                 except OSError as exc:
                     errors.append(f"client disconnected: {exc}")
@@ -1104,7 +1423,14 @@ class SMTPHoneypot:
                 client_socket.close()
             finally:
                 session_end = utc_now()
-                if not suppress_final_log:
+                if transcript.auth_dropped:
+                    errors.append(
+                        f"{transcript.auth_dropped} AUTH attempts not logged "
+                        f"(limit {MAX_AUTH_EVENTS_PER_SESSION} per session)"
+                    )
+                # A rate limited session without logins and mails is only the
+                # rate_limit_block event (logged once with log_block_once)
+                if transcript.outcome != "rate_limited" or auth_events or mail_events:
                     try:
                         self._emit_final_events(
                             session_id=session_id,
@@ -1129,6 +1455,54 @@ class SMTPHoneypot:
                     dest_ip,
                     dest_port,
                 )
+
+    def _capture_mail(
+        self,
+        mail_events: List[Dict[str, Any]],
+        errors: List[str],
+        *,
+        src_ip: str,
+        session_id: str,
+        helo_name: Optional[str],
+        envelope_from: Optional[str],
+        envelope_to: List[str],
+        body: bytes,
+        terminator_found: bool,
+    ) -> None:
+        """Store a received mail and keep its event for the end of the session; never raises."""
+        message_id = str(uuid.uuid4())
+        message_timestamp = utc_now()
+        storage: Dict[str, Any] = {}
+        try:
+            storage = self._store_and_describe_mail(
+                src_ip=src_ip,
+                session_id=session_id,
+                message_id=message_id,
+                body=body,
+            )
+        except Exception as exc:
+            errors.append(f"mail storage failed: {exc}")
+            logger.error("Failed to store mail: %s", exc)
+        for problem in storage.get("errors", []):
+            errors.append(problem)
+
+        mail_events.append(
+            {
+                "mail.message_id": message_id,
+                "mail.timestamp": isoformat_utc(message_timestamp),
+                "mail.sequence": len(mail_events) + 1,
+                "mail.envelope_from": envelope_from,
+                "mail.envelope_to": list(envelope_to),
+                "mail.header_from": storage.get("header_from"),
+                "mail.header_to": storage.get("header_to"),
+                "mail.subject": storage.get("subject"),
+                "mail.sending_mailserver": helo_name,
+                "mail.eml_file": storage.get("eml_file"),
+                "mail.eml_size": storage.get("eml_size"),
+                "mail.truncated": not terminator_found,
+                "attachments": storage.get("attachments", []),
+            }
+        )
 
     def stop(self) -> None:
         self._stopping.set()
@@ -1197,6 +1571,14 @@ def _build_honeypot_servers(
     tls_material: Optional[TlsMaterial],
 ) -> List[SMTPHoneypot]:
     servers: List[SMTPHoneypot] = []
+    # Shared by all listeners, a source cannot multiply its limits over the ports
+    connection_tracker = ConnectionTracker(settings.server.max_connections_per_ip)
+    data_slots = threading.BoundedSemaphore(max(1, settings.server.max_concurrent_data))
+    mail_quota = (
+        MailDirQuota(settings.storage.mail_dir, settings.storage.max_mail_dir_bytes)
+        if settings.storage.max_mail_dir_bytes > 0
+        else None
+    )
     for listener in settings.server.listeners:
         if listener.implicit_tls and tls_context is None:
             logger.warning(
@@ -1229,6 +1611,14 @@ def _build_honeypot_servers(
                 tls_cert_file=tls_material.cert_file if tls_material else None,
                 rate_limiter=rate_limiter,
                 json_logger=json_logger,
+                banner=settings.server.banner,
+                max_session_seconds=settings.server.max_session_seconds,
+                max_recipients=settings.server.max_recipients,
+                max_mails_per_session=settings.server.max_mails_per_session,
+                max_attachments_per_mail=settings.storage.max_attachments_per_mail,
+                connection_tracker=connection_tracker,
+                data_slots=data_slots,
+                mail_quota=mail_quota,
             )
         )
     return servers
@@ -1258,6 +1648,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=None,
     )
     parser.add_argument("--max-connections", type=int, default=None)
+    parser.add_argument("--banner", default=None)
+    parser.add_argument("--max-session-seconds", type=int, default=None)
+    parser.add_argument("--max-connections-per-ip", type=int, default=None)
+    parser.add_argument("--max-recipients", type=int, default=None)
+    parser.add_argument("--max-mails-per-session", type=int, default=None)
+    parser.add_argument("--max-concurrent-data", type=int, default=None)
+    parser.add_argument("--max-attachments-per-mail", type=int, default=None)
+    parser.add_argument("--max-mail-dir-bytes", type=int, default=None)
     parser.add_argument("--log-file", default=None)
     parser.add_argument("--log-level", default=None)
     parser.add_argument("--mail-dir", default=None)
@@ -1407,6 +1805,14 @@ def _settings_from_args(args: argparse.Namespace) -> Settings:
         ("server", "conn_timeout", "conn_timeout"),
         ("server", "max_connections", "max_connections"),
         ("server", "max_mail_body_bytes", "max_mail_body_bytes"),
+        ("server", "banner", "banner"),
+        ("server", "max_session_seconds", "max_session_seconds"),
+        ("server", "max_connections_per_ip", "max_connections_per_ip"),
+        ("server", "max_recipients", "max_recipients"),
+        ("server", "max_mails_per_session", "max_mails_per_session"),
+        ("server", "max_concurrent_data", "max_concurrent_data"),
+        ("storage", "max_attachments_per_mail", "max_attachments_per_mail"),
+        ("storage", "max_mail_dir_bytes", "max_mail_dir_bytes"),
         ("logging", "log_file", "log_file"),
         ("logging", "log_level", "log_level"),
         ("storage", "mail_dir", "mail_dir"),
@@ -1442,6 +1848,13 @@ def run_server() -> None:
     configure_logging(settings.logging.log_level)
     display_banner()
     server_group: Optional[SMTPServerGroup] = None
+    rate_limiter: Optional[RateLimiter] = None
+
+    def _terminate(signum: int, frame: Any) -> None:
+        raise KeyboardInterrupt
+
+    # docker stop sends SIGTERM, shut down as on Ctrl+C
+    signal.signal(signal.SIGTERM, _terminate)
 
     try:
         rate_limiter = RateLimiter(settings.rate_limit)
@@ -1476,6 +1889,8 @@ def run_server() -> None:
         logger.info("Server stopped by user")
         if server_group is not None:
             server_group.stop()
+        if rate_limiter is not None:
+            rate_limiter.flush()
     except Exception as exc:
         logger.error("Error running server: %s", exc)
         sys.exit(1)

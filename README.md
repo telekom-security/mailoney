@@ -82,9 +82,15 @@ The shipped `mailoney.toml` is the recommended starting point:
 ```toml
 [server]
 server_name = "mail01.localdomain"
+banner = "ESMTP Postfix"
 conn_timeout = 30
+max_session_seconds = 300
 max_connections = 100
+max_connections_per_ip = 10
 max_mail_body_bytes = 10485760
+max_recipients = 100
+max_mails_per_session = 20
+max_concurrent_data = 10
 
 [[server.listeners]]
 name = "smtp"
@@ -130,6 +136,7 @@ max_messages_per_ip = 100
 max_messages_per_sender = 25
 log_block_once = true
 state_file = "log/rate_limit_state.json"
+max_keys = 10000
 ```
 
 ### Server Settings
@@ -137,9 +144,15 @@ state_file = "log/rate_limit_state.json"
 | Setting | Meaning |
 | --- | --- |
 | `server_name` | SMTP banner name and TLS certificate CN/SAN. The default `mail01.localdomain` looks like a small internal Linux mail host; avoid product names and container hostnames. |
-| `conn_timeout` | Per-connection inactivity timeout in seconds. `0` disables it. TLS handshakes are limited to 10 seconds, or `conn_timeout` if lower. |
+| `banner` | Text after `220 <server_name>` in the greeting. The default `ESMTP Postfix` matches a stock Postfix. |
+| `conn_timeout` | Per-connection inactivity timeout in seconds. `0` disables it. Each TLS handshake must complete within 10 seconds, or `conn_timeout` if lower. |
+| `max_session_seconds` | Upper bound for a whole session, however active the client is. `0` disables it. |
 | `max_connections` | Maximum concurrent client handlers per listener. |
+| `max_connections_per_ip` | Maximum concurrent connections per source over all listeners (IPv6 counted per /64). `0` disables it. |
 | `max_mail_body_bytes` | Maximum bytes accepted in SMTP `DATA`. Also advertised as SMTP `SIZE`. |
+| `max_recipients` | `RCPT TO` accepted per mail; further ones get `452 4.5.3`. |
+| `max_mails_per_session` | Mails accepted per session; the next `MAIL FROM` ends the session with `421`. |
+| `max_concurrent_data` | Mails received at the same time over all listeners; further `DATA` gets `451 4.3.0`. |
 
 ### Listener Settings
 
@@ -192,6 +205,12 @@ numeric `0` and boolean `false` are kept.
 | `mail_dir` | Base directory for stored `.eml` files and attachments. |
 | `save_mail_bodies` | Writes complete DATA content as `.eml` when true. Metadata is still parsed when false. |
 | `save_attachments` | Extracts MIME attachments when true. |
+| `max_attachments_per_mail` | Attachments stored per mail; `0` for no limit. |
+| `max_mail_dir_bytes` | Upper bound for all files below `mail_dir` (default 1 GiB, `0` for no limit). When it is reached, mails and attachments are no longer written; their metadata is still logged. The folder is measured again at most once a minute, so space freed by a cleanup job is used again. |
+
+Problems that cost data (a limit reached, a part that cannot be decoded) are
+listed in the `errors` field of the event; a mail is logged and acknowledged in
+any case.
 
 Mail files are stored as:
 
@@ -212,13 +231,15 @@ Attachments are stored as:
 | `enabled` | Enables IP and sender rate limiting. |
 | `window_seconds` | Sliding-window length for counting accepted messages. |
 | `block_seconds` | How long an IP or sender stays blocked after exceeding a limit. |
-| `max_messages_per_ip` | Accepted messages per source IP within the window. |
+| `max_messages_per_ip` | Accepted messages per source IP (IPv6 per /64) within the window. |
 | `max_messages_per_sender` | Accepted messages per envelope sender within the window. |
 | `log_block_once` | Logs only the first block event per block period when true. |
-| `state_file` | Persists block state across restarts. |
+| `state_file` | Persists block state across restarts. Written at most every 10 seconds, at once when a block starts. |
+| `max_keys` | Senders and sources kept per scope; the ones quiet longest are dropped first. |
 
 Blocked mail is rejected and not stored. The first block event is written as
-`event.type = "rate_limit_block"`.
+`event.type = "rate_limit_block"`; credentials and mails of that session
+before the block are still logged.
 
 ## Environment Variables
 
@@ -228,14 +249,22 @@ examples are listed in `.env.example`:
 | Variable | Example |
 | --- | --- |
 | `MAILONEY_SERVER_NAME` | `mail01.localdomain` |
+| `MAILONEY_BANNER` | `ESMTP Postfix` |
 | `MAILONEY_CONN_TIMEOUT` | `30` |
+| `MAILONEY_MAX_SESSION_SECONDS` | `300` |
 | `MAILONEY_MAX_CONNECTIONS` | `100` |
+| `MAILONEY_MAX_CONNECTIONS_PER_IP` | `10` |
 | `MAILONEY_MAX_MAIL_BODY_BYTES` | `10485760` |
+| `MAILONEY_MAX_RECIPIENTS` | `100` |
+| `MAILONEY_MAX_MAILS_PER_SESSION` | `20` |
+| `MAILONEY_MAX_CONCURRENT_DATA` | `10` |
 | `MAILONEY_LOG_FILE` | `log/log.json` |
 | `MAILONEY_LOG_LEVEL` | `INFO` |
 | `MAILONEY_MAIL_DIR` | `log/mails` |
 | `MAILONEY_SAVE_MAIL_BODIES` | `true` |
 | `MAILONEY_SAVE_ATTACHMENTS` | `true` |
+| `MAILONEY_MAX_ATTACHMENTS_PER_MAIL` | `50` |
+| `MAILONEY_MAX_MAIL_DIR_BYTES` | `1073741824` |
 | `MAILONEY_TLS_ENABLED` | `true` |
 | `MAILONEY_TLS_AUTO_GENERATE` | `true` |
 | `MAILONEY_TLS_CERT_FILE` | `log/tls/server.crt` |
@@ -247,6 +276,7 @@ examples are listed in `.env.example`:
 | `MAILONEY_RATE_LIMIT_MAX_MESSAGES_PER_SENDER` | `25` |
 | `MAILONEY_RATE_LIMIT_LOG_BLOCK_ONCE` | `true` |
 | `MAILONEY_RATE_LIMIT_STATE_FILE` | `log/rate_limit_state.json` |
+| `MAILONEY_RATE_LIMIT_MAX_KEYS` | `10000` |
 
 Run `python main.py --help` for CLI overrides.
 
@@ -262,17 +292,25 @@ Every event includes session context such as:
 - `listener.name`, `listener.port`, `listener.tls_mode`
 - `tls.used` and TLS details when TLS was negotiated
 - `smtp_input`, containing SMTP commands line by line without DATA body content,
-  capped at the first 200 lines
+  capped at the first 200 lines, 32 KiB and 1 KiB per line
 - `smtp_input_count` (all lines read, including those past the cap) and
   `smtp_input_truncated`
-- `session_outcome`: `ok`, `timeout`, `tls_failed`, `rate_limited`, or `error`
+- `session_outcome`: `ok`, `timeout`, `tls_failed`, `rate_limited`, `limit`
+  (a session limit was reached), or `error`
+- `errors`, when something went wrong or a limit dropped data
 - `session_last_response_code`, the last SMTP reply code sent to the client
 
 Mail events add flat `mail.*` fields such as envelope sender, recipients,
 headers, subject, sending mailserver, stored `.eml` path, and truncation status.
 Attachment metadata is written as `attachment.*` fields. Auth events add
 `auth.method`, `auth.raw`, `auth.username`, `auth.password`, and decode errors
-when present.
+when present. At most 20 auth events are written per session; `errors` counts
+the rest. Every decodable login is accepted, as the honeypot wants the next
+step of the attacker.
+
+A session ends at the latest after `max_session_seconds` or 1000 commands.
+Mailoney answers like Postfix: `AUTH` needs `EHLO` first, `RCPT TO` needs
+`MAIL FROM`, `DATA` needs a recipient, and DATA bodies are dot-unstuffed.
 
 ## Operating Tasks
 

@@ -6,7 +6,9 @@ from __future__ import annotations
 import ipaddress
 import logging
 import os
+import secrets
 import ssl
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -20,6 +22,11 @@ from cryptography.x509.oid import ExtensionOID, NameOID
 from .config import TlsConfig
 
 logger = logging.getLogger(__name__)
+
+# As the snakeoil certificate of a Debian mail server: ten years, made some
+# time ago, not minutes before the first connection
+CERT_VALIDITY_DAYS = 3650
+CERT_MAX_AGE_DAYS = 90
 
 
 @dataclass(frozen=True)
@@ -82,15 +89,18 @@ def _generate_self_signed_certificate(
     subject = issuer = x509.Name(
         [x509.NameAttribute(NameOID.COMMON_NAME, server_name)]
     )
-    now = datetime.now(timezone.utc)
+    not_before = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(
+        days=1 + secrets.randbelow(CERT_MAX_AGE_DAYS),
+        seconds=secrets.randbelow(86400),
+    )
     certificate = (
         x509.CertificateBuilder()
         .subject_name(subject)
         .issuer_name(issuer)
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
-        .not_valid_before(now - timedelta(minutes=5))
-        .not_valid_after(now + timedelta(days=825))
+        .not_valid_before(not_before)
+        .not_valid_after(not_before + timedelta(days=CERT_VALIDITY_DAYS))
         .add_extension(_subject_alt_name(server_name), critical=False)
         .sign(key, hashes.SHA256())
     )
@@ -102,13 +112,29 @@ def _generate_self_signed_certificate(
     )
     cert_bytes = certificate.public_bytes(serialization.Encoding.PEM)
 
-    with key_file.open("wb") as f:
-        f.write(key_bytes)
-    os.chmod(key_file, 0o600)
+    _write_atomic(key_file, key_bytes, 0o600)
+    _write_atomic(cert_file, cert_bytes, 0o640)
 
-    with cert_file.open("wb") as f:
-        f.write(cert_bytes)
-    os.chmod(cert_file, 0o640)
+
+def _write_atomic(path: Path, data: bytes, mode: int) -> None:
+    """Write through a temp file that has its final mode from the start."""
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp_name, path)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+
+
+def _restrict_key(key_file: Path) -> None:
+    try:
+        if key_file.stat().st_mode & 0o077:
+            os.chmod(key_file, 0o600)
+    except OSError as exc:
+        logger.warning("Could not restrict TLS key %s: %s", key_file, exc)
 
 
 def ensure_tls_material(
@@ -123,6 +149,7 @@ def ensure_tls_material(
     if cert_file.exists() and key_file.exists():
         try:
             if _existing_certificate_matches(cert_file, server_name):
+                _restrict_key(key_file)
                 return TlsMaterial(cert_file=str(cert_file), key_file=str(key_file))
         except Exception as exc:
             if not config.auto_generate:
