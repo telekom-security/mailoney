@@ -56,6 +56,12 @@ class ServerConfig(BaseModel):
     conn_timeout: int = 30
     max_connections: int = 100
     max_mail_body_bytes: int = 10_485_760
+    banner: str = "ESMTP Postfix"
+    max_session_seconds: int = 300
+    max_connections_per_ip: int = 10
+    max_recipients: int = 100
+    max_mails_per_session: int = 20
+    max_concurrent_data: int = 10
     listeners: List[ListenerConfig] = Field(default_factory=_default_listeners)
 
 
@@ -72,6 +78,8 @@ class StorageConfig(BaseModel):
     mail_dir: str = "log/mails"
     save_mail_bodies: bool = True
     save_attachments: bool = True
+    max_attachments_per_mail: int = 50
+    max_mail_dir_bytes: int = 1_073_741_824
 
     @property
     def extract_attachments(self) -> bool:
@@ -97,6 +105,7 @@ class RateLimitConfig(BaseModel):
     max_messages_per_sender: int = 25
     log_block_once: bool = True
     state_file: str = "log/rate_limit_state.json"
+    max_keys: int = 10_000
 
 
 class Settings(BaseModel):
@@ -121,6 +130,18 @@ ENV_MAP = {
     "MAILONEY_SERVER_MAX_CONNECTIONS": ("server", "max_connections"),
     "MAILONEY_MAX_MAIL_BODY_BYTES": ("server", "max_mail_body_bytes"),
     "MAILONEY_SERVER_MAX_MAIL_BODY_BYTES": ("server", "max_mail_body_bytes"),
+    "MAILONEY_BANNER": ("server", "banner"),
+    "MAILONEY_SERVER_BANNER": ("server", "banner"),
+    "MAILONEY_MAX_SESSION_SECONDS": ("server", "max_session_seconds"),
+    "MAILONEY_SERVER_MAX_SESSION_SECONDS": ("server", "max_session_seconds"),
+    "MAILONEY_MAX_CONNECTIONS_PER_IP": ("server", "max_connections_per_ip"),
+    "MAILONEY_SERVER_MAX_CONNECTIONS_PER_IP": ("server", "max_connections_per_ip"),
+    "MAILONEY_MAX_RECIPIENTS": ("server", "max_recipients"),
+    "MAILONEY_SERVER_MAX_RECIPIENTS": ("server", "max_recipients"),
+    "MAILONEY_MAX_MAILS_PER_SESSION": ("server", "max_mails_per_session"),
+    "MAILONEY_SERVER_MAX_MAILS_PER_SESSION": ("server", "max_mails_per_session"),
+    "MAILONEY_MAX_CONCURRENT_DATA": ("server", "max_concurrent_data"),
+    "MAILONEY_SERVER_MAX_CONCURRENT_DATA": ("server", "max_concurrent_data"),
     "MAILONEY_LOG_FILE": ("logging", "log_file"),
     "MAILONEY_LOGGING_LOG_FILE": ("logging", "log_file"),
     "MAILONEY_LOG_LEVEL": ("logging", "log_level"),
@@ -133,6 +154,13 @@ ENV_MAP = {
     "MAILONEY_STORAGE_SAVE_ATTACHMENTS": ("storage", "save_attachments"),
     "MAILONEY_EXTRACT_ATTACHMENTS": ("storage", "save_attachments"),
     "MAILONEY_STORAGE_EXTRACT_ATTACHMENTS": ("storage", "save_attachments"),
+    "MAILONEY_MAX_ATTACHMENTS_PER_MAIL": ("storage", "max_attachments_per_mail"),
+    "MAILONEY_STORAGE_MAX_ATTACHMENTS_PER_MAIL": (
+        "storage",
+        "max_attachments_per_mail",
+    ),
+    "MAILONEY_MAX_MAIL_DIR_BYTES": ("storage", "max_mail_dir_bytes"),
+    "MAILONEY_STORAGE_MAX_MAIL_DIR_BYTES": ("storage", "max_mail_dir_bytes"),
     "MAILONEY_TLS_ENABLED": ("tls", "enabled"),
     "MAILONEY_TLS_AUTO_GENERATE": ("tls", "auto_generate"),
     "MAILONEY_TLS_CERT_FILE": ("tls", "cert_file"),
@@ -147,6 +175,7 @@ ENV_MAP = {
     ),
     "MAILONEY_RATE_LIMIT_LOG_BLOCK_ONCE": ("rate_limit", "log_block_once"),
     "MAILONEY_RATE_LIMIT_STATE_FILE": ("rate_limit", "state_file"),
+    "MAILONEY_RATE_LIMIT_MAX_KEYS": ("rate_limit", "max_keys"),
 }
 
 

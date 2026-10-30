@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mailoney"
-version = "3.0.0"
+version = "3.1.0"
 authors = [
     { name = "phin3has", email = "phin3has@protonmail.com" }
 ]
@@ -30,8 +30,8 @@ test = [
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/phin3has/mailoney"
-"Bug Tracker" = "https://github.com/phin3has/mailoney/issues"
+"Homepage" = "https://github.com/telekom-security/mailoney"
+"Bug Tracker" = "https://github.com/telekom-security/mailoney/issues"
 
 [project.scripts]
 mailoney = "mailoney:run_server"
