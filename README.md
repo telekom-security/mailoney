@@ -244,7 +244,7 @@ before the block are still logged.
 ## Environment Variables
 
 Most scalar settings can be overridden with `MAILONEY_*` variables. Common
-examples are listed in `.env.example`:
+examples are listed in `env.example`:
 
 | Variable | Example |
 | --- | --- |
